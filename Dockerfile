@@ -8,33 +8,109 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ENV COMFYUI_PATH=/default-comfyui-bundle/ComfyUI
 
-# Проверяем curl и python3.
-# При необходимости устанавливаем через доступный пакетный менеджер.
+# Проверяем curl.
+# Если curl отсутствует — устанавливаем через доступный пакетный менеджер.
 RUN set -eux; \
-    if ! command -v curl >/dev/null 2>&1; then \
-        if command -v apt-get >/dev/null 2>&1; then \
-            apt-get update; \
-            apt-get install -y --no-install-recommends curl ca-certificates; \
-            rm -rf /var/lib/apt/lists/*; \
-        elif command -v apk >/dev/null 2>&1; then \
-            apk add --no-cache curl ca-certificates; \
-        elif command -v dnf >/dev/null 2>&1; then \
-            dnf install -y curl ca-certificates; \
-            dnf clean all; \
-        elif command -v microdnf >/dev/null 2>&1; then \
-            microdnf install -y curl ca-certificates; \
-            microdnf clean all; \
-        elif command -v yum >/dev/null 2>&1; then \
-            yum install -y curl ca-certificates; \
-            yum clean all; \
-        else \
-            echo "ERROR: curl отсутствует и пакетный менеджер не найден"; \
-            exit 1; \
-        fi; \
+    if command -v curl >/dev/null 2>&1; then \
+        echo "curl already installed"; \
+    elif command -v apt-get >/dev/null 2>&1; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends curl ca-certificates; \
+        rm -rf /var/lib/apt/lists/*; \
+    elif command -v apk >/dev/null 2>&1; then \
+        apk add --no-cache curl ca-certificates bash; \
+    elif command -v dnf >/dev/null 2>&1; then \
+        dnf install -y curl ca-certificates; \
+        dnf clean all; \
+    elif command -v microdnf >/dev/null 2>&1; then \
+        microdnf install -y curl ca-certificates; \
+        microdnf clean all; \
+    elif command -v yum >/dev/null 2>&1; then \
+        yum install -y curl ca-certificates; \
+        yum clean all; \
+    else \
+        echo "ERROR: curl отсутствует и пакетный менеджер не найден"; \
+        exit 1; \
     fi; \
-    command -v python3; \
     curl --version; \
     python3 --version
+
+# Создаём загрузчик, который:
+# 1. принудительно использует HTTP/1.1;
+# 2. сохраняет незавершённый файл как .part;
+# 3. после обрыва продолжает скачивание;
+# 4. делает до 30 попыток.
+RUN <<'SCRIPT'
+set -eux
+
+cat > /usr/local/bin/download-model <<'EOF'
+#!/usr/bin/env bash
+
+set -u
+
+URL="$1"
+OUTPUT="$2"
+PART="${OUTPUT}.part"
+
+MAX_ATTEMPTS=30
+ATTEMPT=1
+
+mkdir -p "$(dirname "${OUTPUT}")"
+
+while [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; do
+    echo "=================================================="
+    echo "Download attempt ${ATTEMPT}/${MAX_ATTEMPTS}"
+    echo "URL: ${URL}"
+    echo "Output: ${OUTPUT}"
+
+    if [ -s "${PART}" ]; then
+        PART_SIZE="$(stat -c%s "${PART}")"
+        echo "Partial file found: ${PART_SIZE} bytes"
+        echo "Continuing download..."
+    else
+        echo "Starting download from zero..."
+    fi
+
+    if curl \
+        --http1.1 \
+        --location \
+        --fail \
+        --show-error \
+        --connect-timeout 30 \
+        --speed-time 300 \
+        --speed-limit 1024 \
+        --continue-at - \
+        --output "${PART}" \
+        "${URL}"; then
+
+        if [ -s "${PART}" ]; then
+            mv "${PART}" "${OUTPUT}"
+
+            FINAL_SIZE="$(stat -c%s "${OUTPUT}")"
+
+            echo "Download finished successfully"
+            echo "Final size: ${FINAL_SIZE} bytes"
+
+            exit 0
+        fi
+    fi
+
+    echo "Attempt ${ATTEMPT} failed"
+
+    ATTEMPT=$((ATTEMPT + 1))
+
+    if [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; then
+        echo "Waiting 15 seconds before continuing..."
+        sleep 15
+    fi
+done
+
+echo "ERROR: download failed after ${MAX_ATTEMPTS} attempts"
+exit 1
+EOF
+
+chmod +x /usr/local/bin/download-model
+SCRIPT
 
 # Проверяем расположение ComfyUI.
 RUN set -eux; \
@@ -43,35 +119,28 @@ RUN set -eux; \
     test -d "${COMFYUI_PATH}/user"; \
     echo "ComfyUI found at: ${COMFYUI_PATH}"
 
-# Очищаем ВСЕ workflow-папки внутри известных папок ComfyUI.
-# Это удаляет старые workflow, оставшиеся в базовом образе.
+# Очищаем все workflow-папки внутри ComfyUI,
+# чтобы в образе не осталось workflow из базового образа.
 RUN set -eux; \
-    for ROOT in \
-        "${COMFYUI_PATH}" \
-        "/ComfyUI" \
-        "/workspace/ComfyUI" \
-        "/opt/ComfyUI"; \
-    do \
-        if [ -d "${ROOT}" ]; then \
-            find "${ROOT}" -type d -name "workflows" -print0 | \
-            while IFS= read -r -d '' WORKFLOW_DIR; do \
-                echo "Cleaning workflow directory: ${WORKFLOW_DIR}"; \
-                find "${WORKFLOW_DIR}" \
-                    -mindepth 1 \
-                    -maxdepth 1 \
-                    -exec rm -rf {} +; \
-            done; \
-        fi; \
+    find "${COMFYUI_PATH}" \
+        -type d \
+        -name "workflows" \
+        -print0 | \
+    while IFS= read -r -d '' WORKFLOW_DIR; do \
+        echo "Cleaning workflow directory: ${WORKFLOW_DIR}"; \
+        find "${WORKFLOW_DIR}" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -exec rm -rf {} +; \
     done
 
-# Очищаем старые checkpoints, LoRA и upscale-модели.
-# SAM и Ultralytics сохраняем, потому что они нужны этому workflow.
+# Создаём необходимые папки и очищаем старые модели.
 RUN set -eux; \
     mkdir -p \
+        "${COMFYUI_PATH}/user/default/workflows" \
         "${COMFYUI_PATH}/models/checkpoints" \
         "${COMFYUI_PATH}/models/loras" \
-        "${COMFYUI_PATH}/models/upscale_models" \
-        "${COMFYUI_PATH}/user/default/workflows"; \
+        "${COMFYUI_PATH}/models/upscale_models"; \
     find "${COMFYUI_PATH}/models/checkpoints" \
         -mindepth 1 \
         -maxdepth 1 \
@@ -86,93 +155,85 @@ RUN set -eux; \
         -exec rm -rf {} +
 
 # GonzaLomoXL checkpoint.
-# Скачиваем v60PhotoXLDMD, но сохраняем под названием,
-# которое прописано внутри workflow.
-RUN curl -L \
-    --fail \
-    --retry 10 \
-    --retry-delay 10 \
-    --connect-timeout 30 \
+# Скачиваем файл v60PhotoXLDMD,
+# но сохраняем под названием из workflow.
+RUN /usr/local/bin/download-model \
     "https://huggingface.co/dedsmetana/GonzaLomoXLFluxPony/resolve/main/gonzalomoXLFluxPony_v60PhotoXLDMD.safetensors" \
-    -o "${COMFYUI_PATH}/models/checkpoints/gonzalomoXLFluxPony_v60newPhotoXLDMD.safetensors"
+    "${COMFYUI_PATH}/models/checkpoints/gonzalomoXLFluxPony_v60newPhotoXLDMD.safetensors"
 
 # Realism LoRA By Stable Yogi.
-RUN curl -L \
-    --fail \
-    --retry 10 \
-    --retry-delay 10 \
-    --connect-timeout 30 \
+RUN /usr/local/bin/download-model \
     "https://huggingface.co/descho/kaia/resolve/c183a62b9df2a2d18deaba19b51a5a325d572bd8/Realism%20Lora%20By%20Stable%20Yogi_V3_Lite.safetensors" \
-    -o "${COMFYUI_PATH}/models/loras/Realism Lora By Stable Yogi_V3_Lite.safetensors"
+    "${COMFYUI_PATH}/models/loras/Realism Lora By Stable Yogi_V3_Lite.safetensors"
 
 # 4x UltraSharp.
-RUN curl -L \
-    --fail \
-    --retry 10 \
-    --retry-delay 10 \
-    --connect-timeout 30 \
+RUN /usr/local/bin/download-model \
     "https://huggingface.co/lokCX/4x-Ultrasharp/resolve/main/4x-UltraSharp.pth" \
-    -o "${COMFYUI_PATH}/models/upscale_models/4x-UltraSharp.pth"
+    "${COMFYUI_PATH}/models/upscale_models/4x-UltraSharp.pth"
 
 # Копируем workflow во временную папку.
 COPY FLUX_PHOTOSHOP_NSFW.json /tmp/FLUX_PHOTOSHOP_NSFW.json
 
-# Исправляем ошибку:
-# resolution: '1.0' not in [...]
+# Исправляем несовместимую FluxResolutionNode.
 #
-# Удаляем несовместимую FluxResolutionNode и её связи.
-# EmptyLatentImage уже содержит прямые значения:
-# width  = 896
-# height = 1536
+# В исходном workflow в ней записано значение "1.0",
+# которое новая версия ноды не принимает.
+#
+# Удаляем FluxResolutionNode и её связи.
+# В EmptyLatentImage устанавливаем прямые значения 896 × 1536.
 RUN python3 - <<'PY'
 import json
 from pathlib import Path
 
-source = Path("/tmp/FLUX_PHOTOSHOP_NSFW.json")
+workflow_path = Path("/tmp/FLUX_PHOTOSHOP_NSFW.json")
 
-with source.open("r", encoding="utf-8") as file:
+with workflow_path.open("r", encoding="utf-8") as file:
     workflow = json.load(file)
 
 nodes = workflow.get("nodes", [])
 links = workflow.get("links", [])
 
-resolution_nodes = {
+resolution_node_ids = {
     node.get("id")
     for node in nodes
     if node.get("type") == "FluxResolutionNode"
 }
 
-removed_link_ids = {
-    link[0]
-    for link in links
-    if len(link) >= 2 and link[1] in resolution_nodes
-}
+if not resolution_node_ids:
+    print("FluxResolutionNode not found — no removal required")
+else:
+    removed_link_ids = {
+        link[0]
+        for link in links
+        if len(link) >= 2 and link[1] in resolution_node_ids
+    }
 
-workflow["nodes"] = [
-    node
-    for node in nodes
-    if node.get("id") not in resolution_nodes
-]
+    workflow["nodes"] = [
+        node
+        for node in nodes
+        if node.get("id") not in resolution_node_ids
+    ]
 
-workflow["links"] = [
-    link
-    for link in links
-    if link[0] not in removed_link_ids
-]
+    workflow["links"] = [
+        link
+        for link in links
+        if link[0] not in removed_link_ids
+    ]
 
-for node in workflow["nodes"]:
-    for node_input in node.get("inputs", []):
-        if node_input.get("link") in removed_link_ids:
-            node_input["link"] = None
+    for node in workflow["nodes"]:
+        for node_input in node.get("inputs", []):
+            if node_input.get("link") in removed_link_ids:
+                node_input["link"] = None
 
-    for node_output in node.get("outputs", []):
-        output_links = node_output.get("links")
-        if isinstance(output_links, list):
-            node_output["links"] = [
-                link_id
-                for link_id in output_links
-                if link_id not in removed_link_ids
-            ]
+        for node_output in node.get("outputs", []):
+            output_links = node_output.get("links")
+
+            if isinstance(output_links, list):
+                node_output["links"] = [
+                    link_id
+                    for link_id in output_links
+                    if link_id not in removed_link_ids
+                ]
 
 empty_latent_nodes = [
     node
@@ -181,15 +242,19 @@ empty_latent_nodes = [
 ]
 
 if not empty_latent_nodes:
-    raise RuntimeError("EmptyLatentImage не найден")
+    raise RuntimeError("EmptyLatentImage не найден в workflow")
 
 for node in empty_latent_nodes:
     values = node.get("widgets_values", [])
 
-    if len(values) >= 3:
-        values[0] = 896
-        values[1] = 1536
-        node["widgets_values"] = values
+    if len(values) < 3:
+        raise RuntimeError(
+            f"У EmptyLatentImage неправильные widgets_values: {values}"
+        )
+
+    values[0] = 896
+    values[1] = 1536
+    node["widgets_values"] = values
 
     for node_input in node.get("inputs", []):
         if node_input.get("name") in {"width", "height"}:
@@ -199,9 +264,9 @@ if any(
     node.get("type") == "FluxResolutionNode"
     for node in workflow["nodes"]
 ):
-    raise RuntimeError("FluxResolutionNode не была удалена")
+    raise RuntimeError("FluxResolutionNode всё ещё находится в workflow")
 
-with source.open("w", encoding="utf-8") as file:
+with workflow_path.open("w", encoding="utf-8") as file:
     json.dump(
         workflow,
         file,
@@ -220,13 +285,13 @@ RUN set -eux; \
         "${COMFYUI_PATH}/user/default/workflows/FLUX_PHOTOSHOP_NSFW.json"; \
     rm -f "/tmp/FLUX_PHOTOSHOP_NSFW.json"
 
-# Проверяем checkpoint, LoRA и upscale-модель.
+# Проверяем скачанные модели.
 RUN set -eux; \
     test -s "${COMFYUI_PATH}/models/checkpoints/gonzalomoXLFluxPony_v60newPhotoXLDMD.safetensors"; \
     test -s "${COMFYUI_PATH}/models/loras/Realism Lora By Stable Yogi_V3_Lite.safetensors"; \
     test -s "${COMFYUI_PATH}/models/upscale_models/4x-UltraSharp.pth"
 
-# Проверяем размеры скачанных файлов.
+# Проверяем размеры файлов.
 RUN set -eux; \
     CHECKPOINT_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/checkpoints/gonzalomoXLFluxPony_v60newPhotoXLDMD.safetensors")"; \
     LORA_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/loras/Realism Lora By Stable Yogi_V3_Lite.safetensors")"; \
@@ -261,7 +326,7 @@ RUN set -eux; \
         -print \
         -quit | grep -q .
 
-# Проверяем workflow и отсутствие проблемной ноды.
+# Проверяем исправленный workflow.
 RUN python3 - <<'PY'
 import json
 from pathlib import Path
@@ -292,18 +357,34 @@ required_types = {
     "EmptyLatentImage",
 }
 
-missing = required_types - node_types
+missing_types = required_types - node_types
 
-if missing:
+if missing_types:
     raise RuntimeError(
-        f"В workflow отсутствуют необходимые ноды: {sorted(missing)}"
+        f"В workflow отсутствуют ноды: {sorted(missing_types)}"
     )
+
+empty_latents = [
+    node
+    for node in workflow.get("nodes", [])
+    if node.get("type") == "EmptyLatentImage"
+]
+
+for node in empty_latents:
+    values = node.get("widgets_values", [])
+
+    if len(values) < 2:
+        raise RuntimeError("У EmptyLatentImage отсутствует разрешение")
+
+    if values[0] != 896 or values[1] != 1536:
+        raise RuntimeError(
+            f"Неправильное разрешение EmptyLatentImage: {values}"
+        )
 
 print("Workflow validation passed")
 PY
 
-# Финальная проверка:
-# во всех workflow-папках ComfyUI должен остаться только один JSON.
+# Проверяем, что во всех workflow-папках остался только один JSON.
 RUN set -eux; \
     find "${COMFYUI_PATH}" \
         -type f \
@@ -312,6 +393,6 @@ RUN set -eux; \
     WORKFLOW_COUNT="$(find "${COMFYUI_PATH}" \
         -type f \
         -path "*/workflows/*.json" | wc -l)"; \
-    echo "Total workflow JSON count: ${WORKFLOW_COUNT}"; \
+    echo "Total workflow count: ${WORKFLOW_COUNT}"; \
     test "${WORKFLOW_COUNT}" -eq 1; \
     test -f "${COMFYUI_PATH}/user/default/workflows/FLUX_PHOTOSHOP_NSFW.json"
