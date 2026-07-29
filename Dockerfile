@@ -8,38 +8,52 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ENV COMFYUI_PATH=/default-comfyui-bundle/ComfyUI
 
-# Проверяем curl.
-# Если curl отсутствует — устанавливаем через доступный пакетный менеджер.
+# Проверяем curl и python3.
+# При необходимости устанавливаем их через доступный пакетный менеджер.
 RUN set -eux; \
-    if command -v curl >/dev/null 2>&1; then \
-        echo "curl already installed"; \
-    elif command -v apt-get >/dev/null 2>&1; then \
-        apt-get update; \
-        apt-get install -y --no-install-recommends curl ca-certificates; \
-        rm -rf /var/lib/apt/lists/*; \
-    elif command -v apk >/dev/null 2>&1; then \
-        apk add --no-cache curl ca-certificates bash; \
-    elif command -v dnf >/dev/null 2>&1; then \
-        dnf install -y curl ca-certificates; \
-        dnf clean all; \
-    elif command -v microdnf >/dev/null 2>&1; then \
-        microdnf install -y curl ca-certificates; \
-        microdnf clean all; \
-    elif command -v yum >/dev/null 2>&1; then \
-        yum install -y curl ca-certificates; \
-        yum clean all; \
-    else \
-        echo "ERROR: curl отсутствует и пакетный менеджер не найден"; \
-        exit 1; \
+    if ! command -v curl >/dev/null 2>&1 || \
+       ! command -v python3 >/dev/null 2>&1; then \
+        if command -v apt-get >/dev/null 2>&1; then \
+            apt-get update; \
+            apt-get install -y --no-install-recommends \
+                curl \
+                ca-certificates \
+                python3; \
+            rm -rf /var/lib/apt/lists/*; \
+        elif command -v apk >/dev/null 2>&1; then \
+            apk add --no-cache \
+                curl \
+                ca-certificates \
+                python3 \
+                bash; \
+        elif command -v dnf >/dev/null 2>&1; then \
+            dnf install -y \
+                curl \
+                ca-certificates \
+                python3; \
+            dnf clean all; \
+        elif command -v microdnf >/dev/null 2>&1; then \
+            microdnf install -y \
+                curl \
+                ca-certificates \
+                python3; \
+            microdnf clean all; \
+        elif command -v yum >/dev/null 2>&1; then \
+            yum install -y \
+                curl \
+                ca-certificates \
+                python3; \
+            yum clean all; \
+        else \
+            echo "ERROR: пакетный менеджер не найден"; \
+            exit 1; \
+        fi; \
     fi; \
     curl --version; \
     python3 --version
 
-# Создаём загрузчик, который:
-# 1. принудительно использует HTTP/1.1;
-# 2. сохраняет незавершённый файл как .part;
-# 3. после обрыва продолжает скачивание;
-# 4. делает до 30 попыток.
+# Создаём устойчивый загрузчик.
+# Он использует HTTP/1.1 и продолжает загрузку после обрыва соединения.
 RUN <<'SCRIPT'
 set -eux
 
@@ -63,10 +77,13 @@ while [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; do
     echo "URL: ${URL}"
     echo "Output: ${OUTPUT}"
 
+    RESUME_ARGS=()
+
     if [ -s "${PART}" ]; then
         PART_SIZE="$(stat -c%s "${PART}")"
         echo "Partial file found: ${PART_SIZE} bytes"
         echo "Continuing download..."
+        RESUME_ARGS=(--continue-at -)
     else
         echo "Starting download from zero..."
     fi
@@ -79,7 +96,7 @@ while [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; do
         --connect-timeout 30 \
         --speed-time 300 \
         --speed-limit 1024 \
-        --continue-at - \
+        "${RESUME_ARGS[@]}" \
         --output "${PART}" \
         "${URL}"; then
 
@@ -100,7 +117,7 @@ while [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; do
     ATTEMPT=$((ATTEMPT + 1))
 
     if [ "${ATTEMPT}" -le "${MAX_ATTEMPTS}" ]; then
-        echo "Waiting 15 seconds before continuing..."
+        echo "Waiting 15 seconds..."
         sleep 15
     fi
 done
@@ -119,28 +136,42 @@ RUN set -eux; \
     test -d "${COMFYUI_PATH}/user"; \
     echo "ComfyUI found at: ${COMFYUI_PATH}"
 
-# Очищаем все workflow-папки внутри ComfyUI,
-# чтобы в образе не осталось workflow из базового образа.
+# Очищаем workflow во всех известных папках ComfyUI.
 RUN set -eux; \
-    find "${COMFYUI_PATH}" \
-        -type d \
-        -name "workflows" \
-        -print0 | \
-    while IFS= read -r -d '' WORKFLOW_DIR; do \
-        echo "Cleaning workflow directory: ${WORKFLOW_DIR}"; \
-        find "${WORKFLOW_DIR}" \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -exec rm -rf {} +; \
+    for ROOT in \
+        "${COMFYUI_PATH}" \
+        "/ComfyUI" \
+        "/workspace/ComfyUI" \
+        "/opt/ComfyUI"; \
+    do \
+        if [ -d "${ROOT}" ]; then \
+            find "${ROOT}" \
+                -type d \
+                -name "workflows" \
+                -print0 | \
+            while IFS= read -r -d '' WORKFLOW_DIR; do \
+                echo "Cleaning workflow directory: ${WORKFLOW_DIR}"; \
+                find "${WORKFLOW_DIR}" \
+                    -mindepth 1 \
+                    -maxdepth 1 \
+                    -exec rm -rf {} +; \
+            done; \
+        fi; \
     done
 
-# Создаём необходимые папки и очищаем старые модели.
+# Создаём необходимые папки моделей.
 RUN set -eux; \
     mkdir -p \
         "${COMFYUI_PATH}/user/default/workflows" \
         "${COMFYUI_PATH}/models/checkpoints" \
         "${COMFYUI_PATH}/models/loras" \
-        "${COMFYUI_PATH}/models/upscale_models"; \
+        "${COMFYUI_PATH}/models/upscale_models" \
+        "${COMFYUI_PATH}/models/sams" \
+        "${COMFYUI_PATH}/models/ultralytics/bbox" \
+        "${COMFYUI_PATH}/models/ultralytics/segm"
+
+# Очищаем старые модели соответствующих категорий.
+RUN set -eux; \
     find "${COMFYUI_PATH}/models/checkpoints" \
         -mindepth 1 \
         -maxdepth 1 \
@@ -152,11 +183,22 @@ RUN set -eux; \
     find "${COMFYUI_PATH}/models/upscale_models" \
         -mindepth 1 \
         -maxdepth 1 \
+        -exec rm -rf {} +; \
+    find "${COMFYUI_PATH}/models/sams" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -exec rm -rf {} +; \
+    find "${COMFYUI_PATH}/models/ultralytics/bbox" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -exec rm -rf {} +; \
+    find "${COMFYUI_PATH}/models/ultralytics/segm" \
+        -mindepth 1 \
+        -maxdepth 1 \
         -exec rm -rf {} +
 
 # GonzaLomoXL checkpoint.
-# Скачиваем файл v60PhotoXLDMD,
-# но сохраняем под названием из workflow.
+# Сохраняем под названием, прописанным внутри workflow.
 RUN /usr/local/bin/download-model \
     "https://huggingface.co/dedsmetana/GonzaLomoXLFluxPony/resolve/main/gonzalomoXLFluxPony_v60PhotoXLDMD.safetensors" \
     "${COMFYUI_PATH}/models/checkpoints/gonzalomoXLFluxPony_v60newPhotoXLDMD.safetensors"
@@ -171,16 +213,31 @@ RUN /usr/local/bin/download-model \
     "https://huggingface.co/lokCX/4x-Ultrasharp/resolve/main/4x-UltraSharp.pth" \
     "${COMFYUI_PATH}/models/upscale_models/4x-UltraSharp.pth"
 
+# Segment Anything — SAM ViT-B.
+RUN /usr/local/bin/download-model \
+    "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth" \
+    "${COMFYUI_PATH}/models/sams/sam_vit_b_01ec64.pth"
+
+# Детектор лица.
+RUN /usr/local/bin/download-model \
+    "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt" \
+    "${COMFYUI_PATH}/models/ultralytics/bbox/face_yolov8m.pt"
+
+# Детектор рук.
+RUN /usr/local/bin/download-model \
+    "https://huggingface.co/Bingsu/adetailer/resolve/main/hand_yolov8s.pt" \
+    "${COMFYUI_PATH}/models/ultralytics/bbox/hand_yolov8s.pt"
+
+# Сегментация тела.
+RUN /usr/local/bin/download-model \
+    "https://huggingface.co/Bingsu/adetailer/resolve/main/person_yolov8m-seg.pt" \
+    "${COMFYUI_PATH}/models/ultralytics/segm/person_yolov8m-seg.pt"
+
 # Копируем workflow во временную папку.
 COPY FLUX_PHOTOSHOP_NSFW.json /tmp/FLUX_PHOTOSHOP_NSFW.json
 
-# Исправляем несовместимую FluxResolutionNode.
-#
-# В исходном workflow в ней записано значение "1.0",
-# которое новая версия ноды не принимает.
-#
-# Удаляем FluxResolutionNode и её связи.
-# В EmptyLatentImage устанавливаем прямые значения 896 × 1536.
+# Убираем несовместимую FluxResolutionNode.
+# Устанавливаем прямое разрешение 896 × 1536.
 RUN python3 - <<'PY'
 import json
 from pathlib import Path
@@ -199,41 +256,46 @@ resolution_node_ids = {
     if node.get("type") == "FluxResolutionNode"
 }
 
-if not resolution_node_ids:
-    print("FluxResolutionNode not found — no removal required")
-else:
-    removed_link_ids = {
-        link[0]
-        for link in links
-        if len(link) >= 2 and link[1] in resolution_node_ids
-    }
+removed_link_ids = {
+    link[0]
+    for link in links
+    if (
+        isinstance(link, list)
+        and len(link) >= 2
+        and link[1] in resolution_node_ids
+    )
+}
 
-    workflow["nodes"] = [
-        node
-        for node in nodes
-        if node.get("id") not in resolution_node_ids
-    ]
+workflow["nodes"] = [
+    node
+    for node in nodes
+    if node.get("id") not in resolution_node_ids
+]
 
-    workflow["links"] = [
-        link
-        for link in links
-        if link[0] not in removed_link_ids
-    ]
+workflow["links"] = [
+    link
+    for link in links
+    if not (
+        isinstance(link, list)
+        and len(link) > 0
+        and link[0] in removed_link_ids
+    )
+]
 
-    for node in workflow["nodes"]:
-        for node_input in node.get("inputs", []):
-            if node_input.get("link") in removed_link_ids:
-                node_input["link"] = None
+for node in workflow["nodes"]:
+    for node_input in node.get("inputs", []):
+        if node_input.get("link") in removed_link_ids:
+            node_input["link"] = None
 
-        for node_output in node.get("outputs", []):
-            output_links = node_output.get("links")
+    for node_output in node.get("outputs", []):
+        output_links = node_output.get("links")
 
-            if isinstance(output_links, list):
-                node_output["links"] = [
-                    link_id
-                    for link_id in output_links
-                    if link_id not in removed_link_ids
-                ]
+        if isinstance(output_links, list):
+            node_output["links"] = [
+                link_id
+                for link_id in output_links
+                if link_id not in removed_link_ids
+            ]
 
 empty_latent_nodes = [
     node
@@ -242,18 +304,19 @@ empty_latent_nodes = [
 ]
 
 if not empty_latent_nodes:
-    raise RuntimeError("EmptyLatentImage не найден в workflow")
+    raise RuntimeError("EmptyLatentImage не найден")
 
 for node in empty_latent_nodes:
     values = node.get("widgets_values", [])
 
     if len(values) < 3:
         raise RuntimeError(
-            f"У EmptyLatentImage неправильные widgets_values: {values}"
+            f"Неправильные widgets_values у EmptyLatentImage: {values}"
         )
 
     values[0] = 896
     values[1] = 1536
+
     node["widgets_values"] = values
 
     for node_input in node.get("inputs", []):
@@ -285,46 +348,42 @@ RUN set -eux; \
         "${COMFYUI_PATH}/user/default/workflows/FLUX_PHOTOSHOP_NSFW.json"; \
     rm -f "/tmp/FLUX_PHOTOSHOP_NSFW.json"
 
-# Проверяем скачанные модели.
+# Проверяем основные модели.
 RUN set -eux; \
     test -s "${COMFYUI_PATH}/models/checkpoints/gonzalomoXLFluxPony_v60newPhotoXLDMD.safetensors"; \
     test -s "${COMFYUI_PATH}/models/loras/Realism Lora By Stable Yogi_V3_Lite.safetensors"; \
     test -s "${COMFYUI_PATH}/models/upscale_models/4x-UltraSharp.pth"
+
+# Проверяем SAM и детекторы.
+RUN set -eux; \
+    test -s "${COMFYUI_PATH}/models/sams/sam_vit_b_01ec64.pth"; \
+    test -s "${COMFYUI_PATH}/models/ultralytics/bbox/face_yolov8m.pt"; \
+    test -s "${COMFYUI_PATH}/models/ultralytics/bbox/hand_yolov8s.pt"; \
+    test -s "${COMFYUI_PATH}/models/ultralytics/segm/person_yolov8m-seg.pt"
 
 # Проверяем размеры файлов.
 RUN set -eux; \
     CHECKPOINT_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/checkpoints/gonzalomoXLFluxPony_v60newPhotoXLDMD.safetensors")"; \
     LORA_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/loras/Realism Lora By Stable Yogi_V3_Lite.safetensors")"; \
     UPSCALER_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/upscale_models/4x-UltraSharp.pth")"; \
+    SAM_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/sams/sam_vit_b_01ec64.pth")"; \
+    FACE_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/ultralytics/bbox/face_yolov8m.pt")"; \
+    HAND_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/ultralytics/bbox/hand_yolov8s.pt")"; \
+    BODY_SIZE="$(stat -c%s "${COMFYUI_PATH}/models/ultralytics/segm/person_yolov8m-seg.pt")"; \
     echo "Checkpoint size: ${CHECKPOINT_SIZE} bytes"; \
     echo "LoRA size: ${LORA_SIZE} bytes"; \
     echo "Upscaler size: ${UPSCALER_SIZE} bytes"; \
+    echo "SAM size: ${SAM_SIZE} bytes"; \
+    echo "Face detector size: ${FACE_SIZE} bytes"; \
+    echo "Hand detector size: ${HAND_SIZE} bytes"; \
+    echo "Body segmentation size: ${BODY_SIZE} bytes"; \
     test "${CHECKPOINT_SIZE}" -gt 5000000000; \
     test "${LORA_SIZE}" -gt 100000000; \
-    test "${UPSCALER_SIZE}" -gt 1000000
-
-# Проверяем SAM и Ultralytics-модели из базового образа.
-RUN set -eux; \
-    find "${COMFYUI_PATH}/models" \
-        -type f \
-        -name "sam_vit_b_01ec64.pth" \
-        -print \
-        -quit | grep -q .; \
-    find "${COMFYUI_PATH}/models" \
-        -type f \
-        -name "face_yolov8m.pt" \
-        -print \
-        -quit | grep -q .; \
-    find "${COMFYUI_PATH}/models" \
-        -type f \
-        -name "hand_yolov8s.pt" \
-        -print \
-        -quit | grep -q .; \
-    find "${COMFYUI_PATH}/models" \
-        -type f \
-        -name "person_yolov8m-seg.pt" \
-        -print \
-        -quit | grep -q .
+    test "${UPSCALER_SIZE}" -gt 1000000; \
+    test "${SAM_SIZE}" -gt 300000000; \
+    test "${FACE_SIZE}" -gt 1000000; \
+    test "${HAND_SIZE}" -gt 1000000; \
+    test "${BODY_SIZE}" -gt 1000000
 
 # Проверяем исправленный workflow.
 RUN python3 - <<'PY'
@@ -384,7 +443,7 @@ for node in empty_latents:
 print("Workflow validation passed")
 PY
 
-# Проверяем, что во всех workflow-папках остался только один JSON.
+# Проверяем, что остался только один workflow.
 RUN set -eux; \
     find "${COMFYUI_PATH}" \
         -type f \
